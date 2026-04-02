@@ -1,0 +1,10 @@
+git add .
+git commit -m "Initial commit: EMA 200 Pullback trading bot"
+git remote add origin https://github.com/Mvxim24/test_signals_bot.git
+git remote add originhttps://github.com/Mvxim24/test_signals_bot.git
+git remote add origin https://github.com/Mvxim24/test_signals_bot.git
+
+git push -u origin main
+git remote add origin https://github.com/Mvxim24/test_signals_bot.git
+
+git push -u origin main
