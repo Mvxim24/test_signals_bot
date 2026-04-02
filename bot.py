@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -26,11 +27,11 @@ db_path = "signals.db"
 bot = Bot(token=TOKEN, session=AiohttpSession())
 dp = Dispatcher()
 
-# === WebSocket Exchange — Bybit (самый стабильный вариант) ===
+# === Bybit WebSocket (самый стабильный вариант) ===
 exchange = ccxtpro.bybit({
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'spot',      # важно: работаем только со спотом
+        'defaultType': 'spot',
     }
 })
 
@@ -112,7 +113,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     key = f"{pair}_{direction}"
     now = datetime.now(timezone.utc)
 
-    if (now - last_signal_time[key]).total_seconds() < 2700:  # 45 минут
+    if (now - last_signal_time[key]).total_seconds() < 2700:
         return
 
     last_signal_time[key] = now
@@ -153,15 +154,16 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
 🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code> <b>({sl_p:+.2f}%)</b>
 
 🕒 <b>Время сигнала:</b> {now.strftime('%d.%m.%Y %H:%M:%S UTC')}
+📍 Биржа: Bybit
 
 🔍 <b>#{hashtag}</b>
-📌 Стратегия от Максима | Bybit"""
+📌 Стратегия от Максима"""
 
     await broadcast_message(text)
     print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ЧЕРЕЗ WEBSOCKET ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (WebSocket) ======================
 async def watch_ohlcv_and_generate():
     global is_generating
     pairs = ["BTC/USDT", "ETH/USDT"]
@@ -169,6 +171,7 @@ async def watch_ohlcv_and_generate():
 
     while True:
         try:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Подключение к WebSocket OHLCV Bybit...")
             for pair in pairs:
                 if is_generating:
                     await asyncio.sleep(0.5)
@@ -180,10 +183,10 @@ async def watch_ohlcv_and_generate():
                         ohlcv = await exchange.watch_ohlcv(pair, timeframe, limit=300)
                         df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
 
-                        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
-
-                        if len(df) < 210 or pd.isna(df.iloc[-1]['ema200']):
+                        if len(df) < 210:
                             continue
+
+                        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
                         curr = df.iloc[-1]
                         prev = df.iloc[-2]
@@ -196,14 +199,12 @@ async def watch_ohlcv_and_generate():
                         sl = tp = None
                         entry = price
 
-                        # LONG
                         if (prev['close'] >= prev['ema200'] and curr['close'] <= curr['ema200']) and close_on_ema:
                             if price <= ema200 * 0.995:
                                 direction = "LONG"
                                 sl = round_price(entry * 0.992, get_tick_size(pair))
                                 tp = round_price(entry * 1.012, get_tick_size(pair))
 
-                        # SHORT
                         elif (prev['close'] <= prev['ema200'] and curr['close'] >= curr['ema200']) and close_on_ema:
                             if price >= ema200 * 1.005:
                                 direction = "SHORT"
@@ -224,11 +225,12 @@ async def watch_ohlcv_and_generate():
                 await asyncio.sleep(0.3)
 
         except Exception as e:
-            logging.error(f"Ошибка WebSocket OHLCV (Bybit): {e}")
+            logging.error(f"Ошибка WebSocket OHLCV Bybit: {e}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Переподключение через 5 сек...")
             await asyncio.sleep(5)
 
 
-# ====================== МОНИТОРИНГ TP/SL ЧЕРЕЗ WEBSOCKET ======================
+# ====================== МОНИТОРИНГ TP/SL (WebSocket) ======================
 async def watch_tickers_and_monitor():
     pairs = ["BTC/USDT", "ETH/USDT"]
 
@@ -261,7 +263,7 @@ async def watch_tickers_and_monitor():
                     elif current_price <= sl:
                         status = "closed_sl"
                         closed = True
-                else:  # SHORT
+                else:
                     if current_price <= tp:
                         status = "closed_tp"
                         closed = True
@@ -289,8 +291,23 @@ async def watch_tickers_and_monitor():
                     print(f"✅ Сигнал закрыт → #{hashtag} | {status}")
 
         except Exception as e:
-            logging.error(f"Ошибка мониторинга WebSocket (Bybit): {e}")
+            logging.error(f"Ошибка мониторинга WebSocket: {e}")
             await asyncio.sleep(3)
+
+
+# ====================== GRACEFUL SHUTDOWN ======================
+async def shutdown():
+    print("⚠️ Выполняется graceful shutdown...")
+    try:
+        await exchange.close()
+    except:
+        pass
+    try:
+        await bot.session.close()
+    except:
+        pass
+    await asyncio.sleep(1)
+    print("✅ Бот завершён корректно.")
 
 
 # ====================== ХЭНДЛЕРЫ ======================
@@ -306,15 +323,14 @@ async def start_cmd(message: types.Message):
     )
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "🤖 Бот использует стратегию **EMA 200 Pullback** на 15-минутном таймфрейме.\n"
-        "📌 <b>Стратегия от Максима</b> | Биржа: Bybit\n\n"
+        "🤖 Бот использует стратегию **EMA 200 Pullback** на 15m.\n"
+        "📍 Биржа: <b>Bybit</b>\n"
         "Сигналы приходят автоматически через WebSocket.",
         parse_mode="HTML",
         reply_markup=kb
     )
 
 
-# (остальные хэндлеры show_history, unsubscribe, subscribe_again — оставлены без изменений)
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
     try:
@@ -341,9 +357,8 @@ async def show_history(message: types.Message):
             text += line
 
         await message.answer(text, parse_mode="HTML")
-
     except Exception as e:
-        logging.error(f"Ошибка в show_history: {e}")
+        logging.error(f"Ошибка истории: {e}")
         await message.answer("❌ Не удалось загрузить историю.")
 
 
@@ -369,14 +384,23 @@ async def main():
     await init_db()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    print("🚀 Бот запущен | Стратегия: EMA 200 Pullback | WebSocket Bybit | От Максима")
+    print("🚀 Бот запущен | EMA 200 Pullback | Bybit WebSocket")
+    print("✅ Polling запущен. WebSocket задачи стартуют в фоне...")
 
-    await asyncio.gather(
-        dp.start_polling(bot),
-        watch_ohlcv_and_generate(),
-        watch_tickers_and_monitor(),
-        return_exceptions=True
-    )
+    # Обработка сигналов от Bothost.ru
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown()))
+
+    try:
+        await asyncio.gather(
+            dp.start_polling(bot),
+            watch_ohlcv_and_generate(),
+            watch_tickers_and_monitor(),
+            return_exceptions=True
+        )
+    finally:
+        await shutdown()
 
 
 if __name__ == "__main__":
