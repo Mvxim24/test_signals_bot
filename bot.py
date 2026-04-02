@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 if not TOKEN:
     raise ValueError("❌ TELEGRAM_TOKEN не найден в .env!")
@@ -27,12 +26,10 @@ db_path = "signals.db"
 bot = Bot(token=TOKEN, session=AiohttpSession())
 dp = Dispatcher()
 
-# === Bybit WebSocket (самый стабильный вариант) ===
+# ==================== Bybit WebSocket ====================
 exchange = ccxtpro.bybit({
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'spot',
-    }
+    'options': {'defaultType': 'spot'}
 })
 
 last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
@@ -70,7 +67,8 @@ async def init_db():
 async def add_subscriber(user: types.User):
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
-            INSERT OR REPLACE INTO subscribers (user_id, username, first_name, subscribed_at)
+            INSERT OR REPLACE INTO subscribers 
+            (user_id, username, first_name, subscribed_at)
             VALUES (?, ?, ?, ?)
         ''', (user.id, user.username, user.first_name, datetime.now(timezone.utc).isoformat()))
         await db.commit()
@@ -92,11 +90,12 @@ async def broadcast_message(text: str):
     subscribers = await get_all_subscribers()
     if not subscribers:
         return
-    tasks = [bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True) for uid in subscribers]
+    tasks = [bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True) 
+             for uid in subscribers]
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
+# ====================== ВСПОМОГАТЕЛЬНЫЕ ======================
 def get_tick_size(symbol: str) -> float:
     try:
         return float(exchange.markets[symbol]['precision']['price'])
@@ -113,7 +112,7 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
     key = f"{pair}_{direction}"
     now = datetime.now(timezone.utc)
 
-    if (now - last_signal_time[key]).total_seconds() < 2700:
+    if (now - last_signal_time[key]).total_seconds() < 2700:  # 45 минут
         return
 
     last_signal_time[key] = now
@@ -133,14 +132,11 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
         signal_id = (await cursor.fetchone())[0]
 
     hashtag = f"SIG_{signal_id:04d}"
-
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
-        await db.commit()
+    await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
+    await db.commit()
 
     emoji = "📈" if direction == "LONG" else "📉"
     direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
-
     tp_p = ((tp - entry_price) / entry_price) * 100
     sl_p = ((sl - entry_price) / entry_price) * 100
 
@@ -149,21 +145,20 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
 {emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
 
 ──────────────────
-💰 <b>Цена входа:</b> <code>{entry_price:,.2f} USDT</code>
-🎯 <b>Take Profit:</b> <code>{tp:,.2f} USDT</code> <b>({tp_p:+.2f}%)</b>
-🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code> <b>({sl_p:+.2f}%)</b>
+💰 Вход: <code>{entry_price:,.2f} USDT</code>
+🎯 TP: <code>{tp:,.2f} USDT</code> <b>({tp_p:+.2f}%)</b>
+🛑 SL: <code>{sl:,.2f} USDT</code> <b>({sl_p:+.2f}%)</b>
 
-🕒 <b>Время сигнала:</b> {now.strftime('%d.%m.%Y %H:%M:%S UTC')}
-📍 Биржа: Bybit
+🕒 {now.strftime('%d.%m.%Y %H:%M:%S UTC')}
+📍 Bybit
 
-🔍 <b>#{hashtag}</b>
-📌 Стратегия от Максима"""
+🔍 #{hashtag} | Стратегия от Максима"""
 
     await broadcast_message(text)
-    print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
+    print(f"✅ Сигнал → {pair} | {direction} | Entry: {entry_price}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (WebSocket) ======================
+# ====================== WebSocket: Генерация сигналов ======================
 async def watch_ohlcv_and_generate():
     global is_generating
     pairs = ["BTC/USDT", "ETH/USDT"]
@@ -171,7 +166,7 @@ async def watch_ohlcv_and_generate():
 
     while True:
         try:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Подключение к WebSocket OHLCV Bybit...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Подключение OHLCV WebSocket Bybit...")
             for pair in pairs:
                 if is_generating:
                     await asyncio.sleep(0.5)
@@ -187,7 +182,6 @@ async def watch_ohlcv_and_generate():
                             continue
 
                         df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
-
                         curr = df.iloc[-1]
                         prev = df.iloc[-2]
                         price = float(curr['close'])
@@ -196,7 +190,6 @@ async def watch_ohlcv_and_generate():
                         close_on_ema = abs(price - ema200) / ema200 <= 0.0005
 
                         direction = None
-                        sl = tp = None
                         entry = price
 
                         if (prev['close'] >= prev['ema200'] and curr['close'] <= curr['ema200']) and close_on_ema:
@@ -213,27 +206,21 @@ async def watch_ohlcv_and_generate():
 
                         if direction:
                             async with aiosqlite.connect(db_path) as db:
-                                open_rows = await db.execute_fetchall("SELECT pair FROM signals WHERE status = 'open'")
-                                open_pairs = {row[0] for row in open_rows}
-
+                                open_pairs = {row[0] for row in await db.execute_fetchall(
+                                    "SELECT pair FROM signals WHERE status = 'open'")}
                             if pair not in open_pairs:
                                 await send_signal(pair, direction, entry, tp, sl)
-
                     finally:
                         is_generating = False
-
                 await asyncio.sleep(0.3)
-
         except Exception as e:
-            logging.error(f"Ошибка WebSocket OHLCV Bybit: {e}")
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Переподключение через 5 сек...")
+            logging.error(f"OHLCV WebSocket ошибка: {e}")
             await asyncio.sleep(5)
 
 
-# ====================== МОНИТОРИНГ TP/SL (WebSocket) ======================
+# ====================== WebSocket: Мониторинг TP/SL ======================
 async def watch_tickers_and_monitor():
     pairs = ["BTC/USDT", "ETH/USDT"]
-
     while True:
         try:
             tickers = {}
@@ -251,23 +238,22 @@ async def watch_tickers_and_monitor():
                 signal_id, pair, direction, tp, sl, hashtag, entry = row
                 if pair not in tickers:
                     continue
-
                 current_price = tickers[pair]
                 closed = False
                 status = None
 
                 if direction == "LONG":
-                    if current_price >= tp:
+                    if current_price >= tp: 
                         status = "closed_tp"
                         closed = True
-                    elif current_price <= sl:
+                    elif current_price <= sl: 
                         status = "closed_sl"
                         closed = True
                 else:
-                    if current_price <= tp:
+                    if current_price <= tp: 
                         status = "closed_tp"
                         closed = True
-                    elif current_price >= sl:
+                    elif current_price >= sl: 
                         status = "closed_sl"
                         closed = True
 
@@ -283,21 +269,21 @@ async def watch_tickers_and_monitor():
                     text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
 
 {status_text}
-Цена закрытия: <b>{current_price:,.2f} USDT</b>
-Вход был: <b>{entry:,.2f} USDT</b>
+Закрытие: <b>{current_price:,.2f} USDT</b>
+Вход: <b>{entry:,.2f} USDT</b>
 Биржа: Bybit"""
 
                     await broadcast_message(text)
-                    print(f"✅ Сигнал закрыт → #{hashtag} | {status}")
+                    print(f"✅ Закрыт сигнал #{hashtag} | {status}")
 
         except Exception as e:
-            logging.error(f"Ошибка мониторинга WebSocket: {e}")
+            logging.error(f"Ticker WebSocket ошибка: {e}")
             await asyncio.sleep(3)
 
 
 # ====================== GRACEFUL SHUTDOWN ======================
 async def shutdown():
-    print("⚠️ Выполняется graceful shutdown...")
+    print("⚠️ Graceful shutdown запущен...")
     try:
         await exchange.close()
     except:
@@ -306,7 +292,6 @@ async def shutdown():
         await bot.session.close()
     except:
         pass
-    await asyncio.sleep(1)
     print("✅ Бот завершён корректно.")
 
 
@@ -322,10 +307,9 @@ async def start_cmd(message: types.Message):
         resize_keyboard=True
     )
     await message.answer(
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "🤖 Бот использует стратегию **EMA 200 Pullback** на 15m.\n"
-        "📍 Биржа: <b>Bybit</b>\n"
-        "Сигналы приходят автоматически через WebSocket.",
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        "🤖 Бот работает на **Bybit** через WebSocket.\n"
+        "Стратегия: EMA 200 Pullback (15m)",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -336,37 +320,33 @@ async def show_history(message: types.Message):
     try:
         async with aiosqlite.connect(db_path) as db:
             history = await db.execute_fetchall("SELECT * FROM signals ORDER BY id DESC LIMIT 20")
-
         if not history:
-            await message.answer("📭 Пока нет сигналов.")
+            await message.answer("📭 Сигналов пока нет.")
             return
 
-        text = "📜 <b>История сигналов (последние 20)</b>\n\n"
+        text = "📜 <b>Последние 20 сигналов</b>\n\n"
         for row in history:
             _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
             emoji = "📈" if direction == "LONG" else "📉"
-            st = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS" if status == "closed_sl" else "⏳ Открыт"
-
-            line = f"<b>#{hashtag}</b> {pair} {direction} {emoji}\n"
-            line += f"Вход: <code>{entry:,.2f}</code>\n"
+            st = "✅ TP" if status == "closed_tp" else "❌ SL" if status == "closed_sl" else "⏳ Открыт"
+            line = f"<b>#{hashtag}</b> {pair} {direction} {emoji}\nВход: <code>{entry:,.2f}</code>\n"
             if close_p:
                 line += f"Закрыто: <code>{close_p:,.2f}</code> — {st}\n"
             else:
                 line += f"Статус: {st}\n"
             line += f"Время: {ts[:16]}\n\n"
             text += line
-
         await message.answer(text, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка истории: {e}")
-        await message.answer("❌ Не удалось загрузить историю.")
+        await message.answer("❌ Ошибка загрузки истории.")
 
 
 @dp.message(F.text == "❌ Отписаться")
 async def unsubscribe(message: types.Message):
     await remove_subscriber(message.from_user.id)
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Подписаться")]], resize_keyboard=True)
-    await message.answer("❌ Вы отписались от сигналов.", reply_markup=kb)
+    await message.answer("❌ Вы отписались.", reply_markup=kb)
 
 
 @dp.message(F.text == "✅ Подписаться")
@@ -376,7 +356,7 @@ async def subscribe_again(message: types.Message):
         keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться")]],
         resize_keyboard=True
     )
-    await message.answer("✅ Подписка успешно активирована!", reply_markup=kb)
+    await message.answer("✅ Подписка активирована!", reply_markup=kb)
 
 
 # ====================== ЗАПУСК ======================
@@ -384,22 +364,29 @@ async def main():
     await init_db()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    print("🚀 Бот запущен | EMA 200 Pullback | Bybit WebSocket")
-    print("✅ Polling запущен. WebSocket задачи стартуют в фоне...")
+    print("🚀 Бот запущен | Bybit WebSocket | EMA 200 Pullback")
+    print("✅ Polling запущен (оптимизировано для Bothost.ru)")
 
-    # Обработка сигналов от Bothost.ru
+    # Обработка SIGTERM от хостинга
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown()))
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
 
+    # Запускаем polling ПЕРВЫМ (важно для Bothost!)
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+
+    # Даём polling время стабилизироваться
+    await asyncio.sleep(3)
+
+    # Запускаем WebSocket задачи в фоне
     try:
         await asyncio.gather(
-            dp.start_polling(bot),
             watch_ohlcv_and_generate(),
             watch_tickers_and_monitor(),
             return_exceptions=True
         )
     finally:
+        polling_task.cancel()
         await shutdown()
 
 
