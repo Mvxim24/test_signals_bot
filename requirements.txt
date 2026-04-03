@@ -1,6 +1,7 @@
-aiogram
-APScheduler
-ccxt
-pandas
-aiosqlite
-python-dotenv
+aiogram==3.13.0
+APScheduler==3.10.4
+ccxt==4.4.0
+pandas==2.2.3
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+tzdata==2025.1
