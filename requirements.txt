@@ -1,5 +1,6 @@
-aiogram
-aiosqlite
-pandas
-python-dotenv
-ccxt[pro]
+aiogram==3.13.0
+ccxt==4.4.0
+pandas==2.2.3
+aiosqlite==0.20.0
+apscheduler==3.10.4
+python-dotenv==1.0.1
