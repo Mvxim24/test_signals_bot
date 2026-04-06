@@ -27,7 +27,11 @@ db_path = "signals.db"
 bot = Bot(token=TOKEN, session=AiohttpSession())
 dp = Dispatcher()
 
-exchange = ccxt.mexc({'enableRateLimit': True})
+# Глобальный обменник
+exchange = ccxt.mexc({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
 
 last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
 is_generating = False
@@ -95,55 +99,65 @@ async def broadcast_message(text: str):
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def get_tick_size(symbol: str) -> float:
-    """Получаем минимальный шаг цены для корректного округления"""
     try:
-        markets = exchange.load_markets()
-        return float(markets[symbol]['precision']['price'])
-    except:
-        return 0.01  # fallback
+        market = exchange.market(symbol)
+        return float(market['precision']['price'])
+    except Exception:
+        return 0.01
 
 
 def round_price(price: float, tick_size: float) -> float:
+    if tick_size <= 0:
+        return round(price, 2)
     return round(price / tick_size) * tick_size
+
+
+async def load_markets_once():
+    try:
+        await asyncio.to_thread(exchange.load_markets)
+        logging.info(f"✅ Загружено {len(exchange.markets)} рынков с MEXC")
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки markets: {e}")
 
 
 # ====================== ОТПРАВКА СИГНАЛА ======================
 async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
-    key = f"{pair}_{direction}"
-    now = datetime.now(timezone.utc)
+    try:
+        key = f"{pair}_{direction}"
+        now = datetime.now(timezone.utc)
 
-    if (now - last_signal_time[key]).total_seconds() < 2700:  # 45 минут
-        return
+        if (now - last_signal_time[key]).total_seconds() < 2700:  # 45 минут
+            return
 
-    last_signal_time[key] = now
+        last_signal_time[key] = now
 
-    tick_size = get_tick_size(pair)
-    entry_price = round_price(entry_price, tick_size)
-    tp = round_price(tp, tick_size)
-    sl = round_price(sl, tick_size)
+        tick_size = get_tick_size(pair)
+        entry_price = round_price(entry_price, tick_size)
+        tp = round_price(tp, tick_size)
+        sl = round_price(sl, tick_size)
 
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute('''
-            INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'open')
-        ''', (pair, direction, entry_price, tp, sl, now.isoformat()))
-        await db.commit()
-        cursor = await db.execute("SELECT last_insert_rowid()")
-        signal_id = (await cursor.fetchone())[0]
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute('''
+                INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'open')
+            ''', (pair, direction, entry_price, tp, sl, now.isoformat()))
+            await db.commit()
+            cursor = await db.execute("SELECT last_insert_rowid()")
+            signal_id = (await cursor.fetchone())[0]
 
-    hashtag = f"SIG_{signal_id:04d}"
+        hashtag = f"SIG_{signal_id:04d}"
 
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
-        await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
+            await db.commit()
 
-    emoji = "📈" if direction == "LONG" else "📉"
-    direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
+        emoji = "📈" if direction == "LONG" else "📉"
+        direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
 
-    tp_p = ((tp - entry_price) / entry_price) * 100
-    sl_p = ((sl - entry_price) / entry_price) * 100
+        tp_p = ((tp - entry_price) / entry_price) * 100
+        sl_p = ((sl - entry_price) / entry_price) * 100
 
-    text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
+        text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
 
 {emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
 
@@ -156,11 +170,14 @@ async def send_signal(pair: str, direction: str, entry_price: float, tp: float, 
 
 🔍 <b>#{hashtag}</b>"""
 
-    await broadcast_message(text)
-    print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
+        await broadcast_message(text)
+        print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
+
+    except Exception as e:
+        logging.error(f"Ошибка при отправке сигнала {pair}: {e}")
 
 
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ (Bollinger Bands Length=25 + EMA фильтр) ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
 async def generate_signals():
     global is_generating
     if is_generating:
@@ -171,72 +188,61 @@ async def generate_signals():
         try:
             pairs = ["BTC/USDT", "ETH/USDT"]
 
-            # Получаем все пары, по которым уже есть открытые сигналы
             async with aiosqlite.connect(db_path) as db:
-                open_rows = await db.execute_fetchall("""
-                    SELECT pair FROM signals WHERE status = 'open'
-                """)
+                open_rows = await db.execute_fetchall("SELECT pair FROM signals WHERE status = 'open'")
                 open_pairs = {row[0] for row in open_rows}
 
             for pair in pairs:
+                if pair in open_pairs:
+                    continue
+
                 try:
-                    # Не открываем новую позицию, если по этой паре уже есть открытый сигнал
-                    if pair in open_pairs:
-                        continue
-
-                    ohlcv = exchange.fetch_ohlcv(pair, '15m', limit=300)
+                    ohlcv = await asyncio.to_thread(exchange.fetch_ohlcv, pair, '15m', limit=300)
                     df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+                    df['close'] = pd.to_numeric(df['close'], errors='coerce')
 
-                    # === Bollinger Bands (Length = 25, StdDev = 2) ===
                     df['bb_middle'] = df['close'].rolling(window=25).mean()
                     df['bb_std'] = df['close'].rolling(window=25).std()
                     df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
                     df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
 
-                    # Фильтр тренда
                     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
                     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
 
-                    if len(df) < 60 or pd.isna(df.iloc[-1]['bb_upper']):
+                    if len(df) < 60 or df.iloc[-1].isna().any():
                         continue
 
                     curr = df.iloc[-1]
-                    price = float(curr['close'])
 
                     direction = None
                     entry_price = None
                     sl = None
                     tp = None
 
-                    # Тело текущей свечи (без теней)
                     body_high = max(curr['open'], curr['close'])
                     body_low = min(curr['open'], curr['close'])
 
-                    # ==================== LONG ====================
-                    if (curr['ema9'] > curr['ema21'] and                    # восходящий тренд
-                        body_high < curr['bb_upper'] and                    # тело НЕ касается верхней полосы
-                        body_low > curr['bb_lower']):                       # тело выше нижней полосы
+                    if (curr['ema9'] > curr['ema21'] and
+                        body_high < curr['bb_upper'] and
+                        body_low > curr['bb_lower']):
 
                         direction = "LONG"
-                        entry_price = body_low                              # вход на Low тела
-                        sl = body_high                                      # SL на High тела
+                        entry_price = body_low
+                        sl = body_high
                         risk = abs(entry_price - sl)
-                        tp = entry_price + (risk * 2)                       # R:R 1:2
+                        tp = entry_price + (risk * 2)
 
-                    # ==================== SHORT ====================
-                    elif (curr['ema9'] < curr['ema21'] and                   # нисходящий тренд
-                          body_low > curr['bb_lower'] and                    # тело НЕ касается нижней полосы
-                          body_high < curr['bb_upper']):                     # тело ниже верхней полосы
+                    elif (curr['ema9'] < curr['ema21'] and
+                          body_low > curr['bb_lower'] and
+                          body_high < curr['bb_upper']):
 
                         direction = "SHORT"
-                        entry_price = body_high                             # вход на High тела
-                        sl = body_low                                       # SL на Low тела
+                        entry_price = body_high
+                        sl = body_low
                         risk = abs(entry_price - sl)
-                        tp = entry_price - (risk * 2)                       # R:R 1:2
+                        tp = entry_price - (risk * 2)
 
-                    # Отправка сигнала
                     if direction and entry_price:
-                        # Дополнительный фильтр по объёму
                         vol_ma = df['vol'].rolling(20).mean().iloc[-1]
                         if float(curr['vol']) > float(vol_ma) * 0.7:
                             await send_signal(pair, direction, entry_price, tp, sl)
@@ -260,7 +266,7 @@ async def monitor_open_signals():
         for row in rows:
             signal_id, pair, direction, tp, sl, hashtag, entry = row
             try:
-                ticker = exchange.fetch_ticker(pair)
+                ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
                 current_price = float(ticker['last'])
 
                 closed = False
@@ -273,7 +279,7 @@ async def monitor_open_signals():
                     elif current_price <= sl:
                         status = "closed_sl"
                         closed = True
-                else:  # SHORT
+                else:
                     if current_price <= tp:
                         status = "closed_tp"
                         closed = True
@@ -300,7 +306,8 @@ async def monitor_open_signals():
                     print(f"✅ Сигнал закрыт → #{hashtag} | {status}")
 
             except Exception as e:
-                logging.error(f"Ошибка мониторинга {hashtag}: {e}")
+                logging.error(f"Ошибка мониторинга {hashtag} ({pair}): {e}")
+
     except Exception as e:
         logging.error(f"Ошибка monitor_open_signals: {e}")
 
@@ -329,9 +336,7 @@ async def start_cmd(message: types.Message):
 async def show_history(message: types.Message):
     try:
         async with aiosqlite.connect(db_path) as db:
-            history = await db.execute_fetchall("""
-                SELECT * FROM signals ORDER BY id DESC LIMIT 20
-            """)
+            history = await db.execute_fetchall("SELECT * FROM signals ORDER BY id DESC LIMIT 20")
 
         if not history:
             await message.answer("📭 Пока нет сигналов.")
@@ -379,10 +384,12 @@ async def subscribe_again(message: types.Message):
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
+    await load_markets_once()
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    scheduler.add_job(generate_signals, 'interval', seconds=20, replace_existing=True)
-    scheduler.add_job(monitor_open_signals, 'interval', seconds=25, replace_existing=True)
+    scheduler.add_job(generate_signals, 'interval', seconds=30, replace_existing=True)
+    scheduler.add_job(monitor_open_signals, 'interval', seconds=20, replace_existing=True)
 
     scheduler.start()
     print("🚀 Бот успешно запущен | Стратегия: Bollinger Bands 25 + EMA9/21 | R:R 1:2")
