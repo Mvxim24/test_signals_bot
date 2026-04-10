@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.session.aiohttp import AiohttpSession
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -24,10 +25,15 @@ if not TOKEN:
 
 db_path = "signals.db"
 
-bot = Bot(token=TOKEN, session=AiohttpSession())
+# ==================== УЛУЧШЕННАЯ ИНИЦИАЛИЗАЦИЯ БОТА ====================
+session = AiohttpSession(timeout=30.0)
+bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
-exchange = ccxt.mexc({'enableRateLimit': True})
+exchange = ccxt.mexc({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
 
 last_signal_time = defaultdict(lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
 is_generating = False
@@ -89,7 +95,8 @@ async def broadcast_message(text: str):
     subscribers = await get_all_subscribers()
     if not subscribers:
         return
-    tasks = [bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True) for uid in subscribers]
+    tasks = [bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True) 
+             for uid in subscribers]
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -99,14 +106,13 @@ def get_tick_size(symbol: str) -> float:
         markets = exchange.load_markets()
         return float(markets[symbol]['precision']['price'])
     except:
-        return 0.01
+        return 0.0001 if 'BTC' in symbol else 0.01
 
 
 def round_price(price: float, tick_size: float) -> float:
     return round(price / tick_size) * tick_size
 
 
-# ====================== МУЛЬТИ-ТАЙМФРЕЙМ ФИЛЬТР (H1) ======================
 def get_higher_tf_trend(pair: str) -> bool:
     """Возвращает True, если на H1 восходящий тренд"""
     try:
@@ -116,63 +122,10 @@ def get_higher_tf_trend(pair: str) -> bool:
         sma50_h = df_h['close'].rolling(50).mean()
         return sma20_h.iloc[-1] > sma50_h.iloc[-1]
     except:
-        return False  # если ошибка — пропускаем сигнал
+        return False
 
 
-# ====================== ОТПРАВКА СИГНАЛА ======================
-async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
-    key = f"{pair}_{direction}"
-    now = datetime.now(timezone.utc)
-
-    if (now - last_signal_time[key]).total_seconds() < 2700:  # 45 минут
-        return
-
-    last_signal_time[key] = now
-
-    tick_size = get_tick_size(pair)
-    entry_price = round_price(entry_price, tick_size)
-    tp = round_price(tp, tick_size)
-    sl = round_price(sl, tick_size)
-
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute('''
-            INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'open')
-        ''', (pair, direction, entry_price, tp, sl, now.isoformat()))
-        await db.commit()
-        cursor = await db.execute("SELECT last_insert_rowid()")
-        signal_id = (await cursor.fetchone())[0]
-
-    hashtag = f"SIG_{signal_id:04d}"
-
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
-        await db.commit()
-
-    emoji = "📈" if direction == "LONG" else "📉"
-    direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
-
-    tp_p = ((tp - entry_price) / entry_price) * 100
-    sl_p = ((sl - entry_price) / entry_price) * 100
-
-    text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
-
-{emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
-
-──────────────────
-💰 <b>Цена входа:</b> <code>{entry_price:,.2f} USDT</code>
-🎯 <b>Take Profit:</b> <code>{tp:,.2f} USDT</code> <b>(+{tp_p:.2f}%)</b>
-🛑 <b>Stop Loss:</b> <code>{sl:,.2f} USDT</code> <b>({sl_p:.2f}%)</b>
-
-🕒 <b>Время сигнала:</b> {now.strftime('%d.%m.%Y %H:%M:%S UTC')}
-
-🔍 <b>#{hashtag}</b>"""
-
-    await broadcast_message(text)
-    print(f"✅ Сигнал отправлен → {pair} | {direction} | Entry: {entry_price}")
-
-
-# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ — УЛУЧШЕННАЯ ВЕРСИЯ (Вариант А) ======================
+# ====================== ГЕНЕРАЦИЯ СИГНАЛОВ ======================
 async def generate_signals():
     global is_generating
     if is_generating:
@@ -181,27 +134,30 @@ async def generate_signals():
     async with generate_lock:
         is_generating = True
         try:
-            pairs = ["BTC/USDT", "ETH/USDT"]
+            pairs = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 
             async with aiosqlite.connect(db_path) as db:
                 open_rows = await db.execute_fetchall("SELECT pair FROM signals WHERE status = 'open'")
                 open_pairs = {row[0] for row in open_rows}
 
-            for pair in pairs:
-                try:
-                    if pair in open_pairs:
-                        continue
+            logging.info(f"🔄 Запуск генерации сигналов. Открытых: {len(open_pairs)}")
 
-                    ohlcv = exchange.fetch_ohlcv(pair, '15m', limit=400)
+            for pair in pairs:
+                if pair in open_pairs:
+                    continue
+
+                try:
+                    # Асинхронные запросы к бирже
+                    ohlcv = await asyncio.to_thread(exchange.fetch_ohlcv, pair, '15m', limit=400)
                     df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
 
-                    # === Индикаторы ===
+                    # Индикаторы
                     df['sma20'] = df['close'].rolling(20).mean()
                     df['sma50'] = df['close'].rolling(50).mean()
                     df['sma200'] = df['close'].rolling(200).mean()
                     df['vol_ma20'] = df['vol'].rolling(20).mean()
 
-                    # ATR (ручной расчёт)
+                    # ATR
                     df['tr'] = pd.concat([
                         df['high'] - df['low'],
                         abs(df['high'] - df['close'].shift()),
@@ -218,37 +174,37 @@ async def generate_signals():
                     vol = float(curr['vol'])
                     vol_ma = float(curr['vol_ma20'])
                     atr = float(curr['atr'])
-                    tick_size = get_tick_size(pair)
 
-                    direction = None
-                    sl = tp = None
-
-                    # === Улучшенная стратегия Вариант А ===
+                    # Тренды
                     is_bull_trend = (curr['sma20'] > curr['sma50'] > curr['sma200']) and (curr['sma20'] > curr['sma200'] * 1.005)
                     is_bear_trend = (curr['sma20'] < curr['sma50'] < curr['sma200']) and (curr['sma20'] < curr['sma200'] * 0.995)
 
-                    # Фильтр сильного тренда на H1
-                    if is_bull_trend:
-                        if not get_higher_tf_trend(pair):
-                            continue
-                    elif is_bear_trend:
-                        if get_higher_tf_trend(pair):   # если на H1 бычий — пропускаем шорт
-                            continue
-                    else:
-                        continue  # нет чёткого тренда — пропускаем
+                    h1_bull = await asyncio.to_thread(get_higher_tf_trend, pair)
 
-                    # LONG
+                    logging.info(f"{pair} | Bull: {is_bull_trend} | Bear: {is_bear_trend} | H1 Bull: {h1_bull} | "
+                                 f"Vol Ratio: {vol/vol_ma:.2f if vol_ma > 0 else 0:.2f}")
+
+                    if is_bull_trend and not h1_bull:
+                        continue
+                    if is_bear_trend and h1_bull:
+                        continue
+                    if not (is_bull_trend or is_bear_trend):
+                        continue
+
+                    direction = None
+                    sl = tp = None
+                    tick_size = await asyncio.to_thread(get_tick_size, pair)
+
                     if is_bull_trend:
                         if (prev['close'] <= prev['sma20'] and 
                             curr['close'] > curr['sma20'] and 
-                            curr['close'] > curr['open'] and           # бычья свеча
-                            vol > vol_ma * 1.15):                      # строгий объём
+                            curr['close'] > curr['open'] and 
+                            vol > vol_ma * 1.15):
                             
                             direction = "LONG"
                             sl = round_price(price - atr * 1.85, tick_size)
-                            tp = round_price(price + atr * 3.1, tick_size)   # RR ≈ 1:1.67
+                            tp = round_price(price + atr * 3.1, tick_size)
 
-                    # SHORT
                     elif is_bear_trend:
                         if (prev['close'] >= prev['sma20'] and 
                             curr['close'] < curr['sma20'] and 
@@ -260,6 +216,7 @@ async def generate_signals():
                             tp = round_price(price - atr * 3.1, tick_size)
 
                     if direction:
+                        logging.info(f"✅ СИГНАЛ → {pair} {direction}")
                         await send_signal(pair, direction, price, tp, sl)
 
                 except Exception as e:
@@ -267,6 +224,52 @@ async def generate_signals():
 
         finally:
             is_generating = False
+
+
+# ====================== ОТПРАВКА СИГНАЛА ======================
+async def send_signal(pair: str, direction: str, entry_price: float, tp: float, sl: float):
+    key = f"{pair}_{direction}"
+    now = datetime.now(timezone.utc)
+
+    if (now - last_signal_time[key]).total_seconds() < 2700:  # 45 минут
+        return
+
+    last_signal_time[key] = now
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute('''
+            INSERT INTO signals (pair, direction, entry_price, tp, sl, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'open')
+        ''', (pair, direction, entry_price, tp, sl, now.isoformat()))
+        await db.commit()
+        cursor = await db.execute("SELECT last_insert_rowid()")
+        signal_id = (await cursor.fetchone())[0]
+
+    hashtag = f"SIG_{signal_id:04d}"
+    await db.execute("UPDATE signals SET hashtag = ? WHERE id = ?", (hashtag, signal_id))
+    await db.commit()
+
+    emoji = "📈" if direction == "LONG" else "📉"
+    direction_text = "LONG ▲" if direction == "LONG" else "SHORT ▼"
+
+    tp_p = ((tp - entry_price) / entry_price) * 100
+    sl_p = ((sl - entry_price) / entry_price) * 100
+
+    text = f"""🚨 <b>НОВЫЙ ТОРГОВЫЙ СИГНАЛ #{hashtag}</b>
+
+{emoji} <b>{pair}</b> — <b>{direction_text}</b> {emoji}
+
+──────────────────
+💰 <b>Цена входа:</b> <code>{entry_price:,.4f} USDT</code>
+🎯 <b>Take Profit:</b> <code>{tp:,.4f} USDT</code> <b>(+{tp_p:.2f}%)</b>
+🛑 <b>Stop Loss:</b> <code>{sl:,.4f} USDT</code> <b>({sl_p:.2f}%)</b>
+
+🕒 <b>Время:</b> {now.strftime('%d.%m.%Y %H:%M:%S UTC')}
+
+🔍 <b>#{hashtag}</b>"""
+
+    await broadcast_message(text)
+    print(f"📤 Сигнал отправлен → {pair} | {direction}")
 
 
 # ====================== МОНИТОРИНГ TP/SL ======================
@@ -281,7 +284,7 @@ async def monitor_open_signals():
         for row in rows:
             signal_id, pair, direction, tp, sl, hashtag, entry = row
             try:
-                ticker = exchange.fetch_ticker(pair)
+                ticker = await asyncio.to_thread(exchange.fetch_ticker, pair)
                 current_price = float(ticker['last'])
 
                 closed = False
@@ -314,14 +317,15 @@ async def monitor_open_signals():
                     text = f"""📢 <b>Сигнал закрыт #{hashtag}</b>
 
 {status_text}
-Цена закрытия: <b>{current_price:,.2f} USDT</b>
-Вход был: <b>{entry:,.2f} USDT</b>"""
+Цена закрытия: <b>{current_price:,.4f} USDT</b>
+Вход: <b>{entry:,.4f} USDT</b>"""
 
                     await broadcast_message(text)
-                    print(f"✅ Сигнал закрыт → #{hashtag} | {status}")
+                    print(f"🔒 Сигнал закрыт → #{hashtag} | {status}")
 
             except Exception as e:
                 logging.error(f"Ошибка мониторинга {hashtag}: {e}")
+
     except Exception as e:
         logging.error(f"Ошибка monitor_open_signals: {e}")
 
@@ -339,14 +343,13 @@ async def start_cmd(message: types.Message):
     )
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "🤖 Бот использует **улучшенную стратегию SMA 20/50/200 + ATR + H1 фильтр** на 15m.\n\n"
-        "Сигналы стали значительно качественнее.",
+        "🤖 Бот работает на улучшенной стратегии SMA + ATR + H1 фильтр.\n"
+        "Сигналы приходят реже, но качественнее.",
         parse_mode="HTML",
         reply_markup=kb
     )
 
 
-# (Остальные хэндлеры без изменений)
 @dp.message(F.text == "📜 История сигналов")
 async def show_history(message: types.Message):
     try:
@@ -359,26 +362,26 @@ async def show_history(message: types.Message):
             await message.answer("📭 Пока нет сигналов.")
             return
 
-        text = "📜 <b>История сигналов (последние 20)</b>\n\n"
+        text = "📜 <b>Последние 20 сигналов:</b>\n\n"
         for row in history:
             _, pair, direction, entry, tp, sl, ts, status, close_p, hashtag = row
             emoji = "📈" if direction == "LONG" else "📉"
-            st = "✅ TAKE PROFIT" if status == "closed_tp" else "❌ STOP LOSS" if status == "closed_sl" else "⏳ Открыт"
+            st = "✅ TP" if status == "closed_tp" else "❌ SL" if status == "closed_sl" else "⏳ Открыт"
 
             line = f"<b>#{hashtag}</b> {pair} {direction} {emoji}\n"
-            line += f"Вход: <code>{entry:,.2f}</code>\n"
+            line += f"Вход: <code>{entry:,.4f}</code> | "
             if close_p:
-                line += f"Закрыто: <code>{close_p:,.2f}</code> — {st}\n"
+                line += f"Закрыто: <code>{close_p:,.4f}</code> — {st}\n"
             else:
-                line += f"Статус: {st}\n"
+                line += f"TP: <code>{tp:,.4f}</code> | SL: <code>{sl:,.4f}</code>\n"
             line += f"Время: {ts[:16]}\n\n"
             text += line
 
         await message.answer(text, parse_mode="HTML")
 
     except Exception as e:
-        logging.error(f"Ошибка в show_history: {e}")
-        await message.answer("❌ Не удалось загрузить историю.")
+        logging.error(f"Ошибка истории: {e}")
+        await message.answer("❌ Ошибка загрузки истории.")
 
 
 @dp.message(F.text == "❌ Отписаться")
@@ -395,19 +398,23 @@ async def subscribe_again(message: types.Message):
         keyboard=[[KeyboardButton(text="📜 История сигналов")], [KeyboardButton(text="❌ Отписаться")]],
         resize_keyboard=True
     )
-    await message.answer("✅ Подписка успешно активирована!", reply_markup=kb)
+    await message.answer("✅ Подписка активирована!", reply_markup=kb)
 
 
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
 
-    scheduler.add_job(generate_signals, 'interval', seconds=20, replace_existing=True)
-    scheduler.add_job(monitor_open_signals, 'interval', seconds=25, replace_existing=True)
+    # Увеличенные интервалы для стабильности
+    scheduler.add_job(generate_signals, 'interval', seconds=45, replace_existing=True)
+    scheduler.add_job(monitor_open_signals, 'interval', seconds=30, replace_existing=True)
 
     scheduler.start()
-    print("🚀 Бот успешно запущен | Улучшенная стратегия: SMA20/50/200 + ATR + H1 фильтр")
+    print("🚀 Бот успешно запущен | Улучшенная версия с анти-таймаутами")
 
     try:
         await dp.start_polling(bot)
